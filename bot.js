@@ -1,10 +1,302 @@
 require('dotenv').config();
 const { Telegraf, Markup, session } = require('telegraf');
+const { Pool } = require('pg');
 
 const BOT_TOKEN = process.env.BOT_TOKEN;
 if (!BOT_TOKEN) throw new Error('❌ BOT_TOKEN no definido en .env');
 
+const ADMIN_ID = parseInt(process.env.ADMIN_ID);
+if (!ADMIN_ID) throw new Error('❌ ADMIN_ID no definido en .env');
+
+// ============================================================
+// BASE DE DATOS — PostgreSQL (Railway)
+// ============================================================
+
+const pool = new Pool({
+  connectionString: process.env.DATABASE_URL,
+  ssl: process.env.NODE_ENV === 'production' ? { rejectUnauthorized: false } : false,
+});
+
+async function dbInit() {
+  await pool.query(`
+    CREATE TABLE IF NOT EXISTS members (
+      user_id     BIGINT PRIMARY KEY,
+      username    TEXT,
+      first_name  TEXT,
+      status      TEXT NOT NULL DEFAULT 'pending',
+      requested_at TIMESTAMPTZ DEFAULT NOW(),
+      approved_at  TIMESTAMPTZ
+    )
+  `);
+  // El admin siempre tiene acceso
+  await pool.query(`
+    INSERT INTO members (user_id, username, first_name, status, approved_at)
+    VALUES ($1, 'admin', 'Administrador', 'active', NOW())
+    ON CONFLICT (user_id) DO NOTHING
+  `, [ADMIN_ID]);
+  console.log('✅ Base de datos lista');
+}
+
+async function isAuthorized(userId) {
+  if (userId === ADMIN_ID) return true;
+  const res = await pool.query(
+    `SELECT status FROM members WHERE user_id = $1`, [userId]
+  );
+  return res.rows.length > 0 && res.rows[0].status === 'active';
+}
+
+async function hasPendingRequest(userId) {
+  const res = await pool.query(
+    `SELECT status FROM members WHERE user_id = $1 AND status = 'pending'`, [userId]
+  );
+  return res.rows.length > 0;
+}
+
+async function addMember(userId, username, firstName) {
+  await pool.query(`
+    INSERT INTO members (user_id, username, first_name, status, approved_at)
+    VALUES ($1, $2, $3, 'active', NOW())
+    ON CONFLICT (user_id) DO UPDATE SET status = 'active', approved_at = NOW(),
+    username = $2, first_name = $3
+  `, [userId, username || 'sin_usuario', firstName || 'Usuario']);
+}
+
+async function removeMember(userId) {
+  const res = await pool.query(
+    `UPDATE members SET status = 'banned' WHERE user_id = $1 RETURNING *`, [userId]
+  );
+  return res.rows.length > 0;
+}
+
+async function listMembers() {
+  const res = await pool.query(
+    `SELECT user_id, username, first_name, status, approved_at
+     FROM members WHERE status = 'active' ORDER BY approved_at ASC`
+  );
+  return res.rows;
+}
+
+async function registerRequest(userId, username, firstName) {
+  await pool.query(`
+    INSERT INTO members (user_id, username, first_name, status)
+    VALUES ($1, $2, $3, 'pending')
+    ON CONFLICT (user_id) DO NOTHING
+  `, [userId, username || 'sin_usuario', firstName || 'Usuario']);
+}
+
+// ============================================================
+// MIDDLEWARE DE AUTORIZACIÓN
+// ============================================================
+
+async function authMiddleware(ctx, next) {
+  const userId = ctx.from?.id;
+  if (!userId) return;
+
+  // Comandos permitidos sin autorización
+  const text = ctx.message?.text || '';
+  const allowedWithout = ['/start', '/solicitar', '/myid'];
+  const isCallbackSolicitar = ctx.callbackQuery?.data?.startsWith('solicitar:');
+  if (allowedWithout.some(c => text.startsWith(c)) || isCallbackSolicitar) {
+    return next();
+  }
+
+  const authorized = await isAuthorized(userId);
+  if (authorized) return next();
+
+  // Usuario no autorizado
+  const pending = await hasPendingRequest(userId);
+  if (pending) {
+    return ctx.reply(
+      `⏳ *Tu solicitud está pendiente de aprobación.*\n\n` +
+      `El administrador revisará tu acceso próximamente.`,
+      { parse_mode: 'Markdown' }
+    );
+  }
+
+  return ctx.reply(
+    `🔒 *Acceso restringido*\n\n` +
+    `Este bot es privado. Si eres abogado colegiado y deseas acceso, envía:\n\n` +
+    `/solicitar`,
+    { parse_mode: 'Markdown' }
+  );
+}
+
+// ============================================================
+// COMANDOS DE ADMINISTRACIÓN
+// ============================================================
+
+function isAdmin(ctx) {
+  return ctx.from?.id === ADMIN_ID;
+}
+
+// /myid — cualquier usuario puede ver su ID
+const setupAdminCommands = (bot) => {
+
+  bot.command('myid', ctx => {
+    const u = ctx.from;
+    ctx.reply(
+      `🪪 *Tu información de Telegram:*\n\n` +
+      `🆔 ID: \`${u.id}\`\n` +
+      `👤 Nombre: ${u.first_name || '—'}\n` +
+      `📛 Usuario: @${u.username || 'sin usuario'}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // /solicitar — el usuario pide acceso
+  bot.command('solicitar', async ctx => {
+    const u = ctx.from;
+    if (await isAuthorized(u.id)) {
+      return ctx.reply('✅ Ya tienes acceso al bot. Usa /start para comenzar.');
+    }
+    if (await hasPendingRequest(u.id)) {
+      return ctx.reply('⏳ Ya tienes una solicitud pendiente. El administrador la revisará pronto.');
+    }
+    await registerRequest(u.id, u.username, u.first_name);
+    await ctx.reply(
+      `📨 *Solicitud enviada*\n\nEl administrador revisará tu acceso. Te notificaremos cuando sea aprobado.`,
+      { parse_mode: 'Markdown' }
+    );
+    // Notificar al admin
+    await bot.telegram.sendMessage(
+      ADMIN_ID,
+      `🔔 *Nueva solicitud de acceso*\n\n` +
+      `👤 Nombre: ${u.first_name || '—'}\n` +
+      `📛 Usuario: @${u.username || 'sin usuario'}\n` +
+      `🆔 ID: \`${u.id}\``,
+      {
+        parse_mode: 'Markdown',
+        ...Markup.inlineKeyboard([
+          [
+            Markup.button.callback('✅ Aprobar', `solicitar:aprobar:${u.id}`),
+            Markup.button.callback('❌ Rechazar', `solicitar:rechazar:${u.id}`),
+          ]
+        ])
+      }
+    );
+  });
+
+  // Aprobar / Rechazar desde botones inline
+  bot.action(/^solicitar:(aprobar|rechazar):(\d+)$/, async ctx => {
+    if (!isAdmin(ctx)) return ctx.answerCbQuery('⛔ Solo el administrador puede hacer esto.');
+    const accion = ctx.match[1];
+    const targetId = parseInt(ctx.match[2]);
+
+    const res = await pool.query(`SELECT * FROM members WHERE user_id = $1`, [targetId]);
+    if (!res.rows.length) return ctx.answerCbQuery('Usuario no encontrado.');
+    const u = res.rows[0];
+
+    if (accion === 'aprobar') {
+      await pool.query(
+        `UPDATE members SET status = 'active', approved_at = NOW() WHERE user_id = $1`, [targetId]
+      );
+      await ctx.editMessageText(
+        `✅ *Acceso aprobado*\n\n👤 ${u.first_name} (@${u.username})\n🆔 \`${targetId}\``,
+        { parse_mode: 'Markdown' }
+      );
+      await bot.telegram.sendMessage(
+        targetId,
+        `✅ *¡Tu acceso fue aprobado!*\n\nYa puedes usar el bot. Escribe /start para comenzar.`,
+        { parse_mode: 'Markdown' }
+      ).catch(() => {});
+    } else {
+      await pool.query(`DELETE FROM members WHERE user_id = $1`, [targetId]);
+      await ctx.editMessageText(
+        `❌ *Solicitud rechazada*\n\n👤 ${u.first_name} (@${u.username})\n🆔 \`${targetId}\``,
+        { parse_mode: 'Markdown' }
+      );
+      await bot.telegram.sendMessage(
+        targetId,
+        `❌ Tu solicitud de acceso fue rechazada.\n\nSi crees que es un error, contacta al administrador.`
+      ).catch(() => {});
+    }
+    await ctx.answerCbQuery();
+  });
+
+  // /adduser <id> — agregar manualmente por ID
+  bot.command('adduser', async ctx => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Solo el administrador puede usar este comando.');
+    const parts = ctx.message.text.split(' ');
+    const targetId = parseInt(parts[1]);
+    if (!targetId) return ctx.reply('❗ Uso correcto: `/adduser 123456789`', { parse_mode: 'Markdown' });
+    await addMember(targetId, null, `Usuario-${targetId}`);
+    await ctx.reply(`✅ Usuario \`${targetId}\` agregado correctamente.`, { parse_mode: 'Markdown' });
+    await bot.telegram.sendMessage(
+      targetId,
+      `✅ *¡Tu acceso fue aprobado!*\n\nYa puedes usar el bot. Escribe /start para comenzar.`,
+      { parse_mode: 'Markdown' }
+    ).catch(() => {});
+  });
+
+  // /removeuser <id> — expulsar usuario
+  bot.command('removeuser', async ctx => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Solo el administrador puede usar este comando.');
+    const parts = ctx.message.text.split(' ');
+    const targetId = parseInt(parts[1]);
+    if (!targetId) return ctx.reply('❗ Uso correcto: `/removeuser 123456789`', { parse_mode: 'Markdown' });
+    if (targetId === ADMIN_ID) return ctx.reply('⛔ No puedes expulsarte a ti mismo.');
+    const ok = await removeMember(targetId);
+    if (ok) {
+      await ctx.reply(`🚫 Usuario \`${targetId}\` ha sido expulsado.`, { parse_mode: 'Markdown' });
+      await bot.telegram.sendMessage(
+        targetId,
+        `🚫 Tu acceso al bot ha sido revocado por el administrador.`
+      ).catch(() => {});
+    } else {
+      await ctx.reply(`❗ No se encontró al usuario \`${targetId}\`.`, { parse_mode: 'Markdown' });
+    }
+  });
+
+  // /listusers — ver todos los miembros activos
+  bot.command('listusers', async ctx => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Solo el administrador puede usar este comando.');
+    const members = await listMembers();
+    if (!members.length) return ctx.reply('📭 No hay miembros activos todavía.');
+    const lines = members.map((m, i) => {
+      const fecha = m.approved_at ? new Date(m.approved_at).toLocaleDateString('es-HN') : '—';
+      return `${i + 1}. ${m.first_name} (@${m.username}) — \`${m.user_id}\` — ${fecha}`;
+    });
+    await ctx.reply(
+      `👥 *Miembros activos (${members.length}):*\n\n${lines.join('\n')}`,
+      { parse_mode: 'Markdown' }
+    );
+  });
+
+  // /pendientes — ver solicitudes pendientes
+  bot.command('pendientes', async ctx => {
+    if (!isAdmin(ctx)) return ctx.reply('⛔ Solo el administrador puede usar este comando.');
+    const res = await pool.query(
+      `SELECT * FROM members WHERE status = 'pending' ORDER BY requested_at ASC`
+    );
+    if (!res.rows.length) return ctx.reply('📭 No hay solicitudes pendientes.');
+    for (const u of res.rows) {
+      await ctx.reply(
+        `🔔 *Solicitud pendiente*\n\n` +
+        `👤 ${u.first_name} (@${u.username})\n🆔 \`${u.user_id}\``,
+        {
+          parse_mode: 'Markdown',
+          ...Markup.inlineKeyboard([
+            [
+              Markup.button.callback('✅ Aprobar', `solicitar:aprobar:${u.user_id}`),
+              Markup.button.callback('❌ Rechazar', `solicitar:rechazar:${u.user_id}`),
+            ]
+          ])
+        }
+      );
+    }
+  });
+};
+
+
 const bot = new Telegraf(BOT_TOKEN);
+
+// Middleware de sesión y autorización (antes de cualquier handler)
+bot.use(session());
+bot.use(authMiddleware);
+
+// Comandos de administración
+setupAdminCommands(bot);
+
 
 // ============================================================
 // DATOS DEL ARANCEL DEL PROFESIONAL DEL DERECHO - CAH 2017
@@ -1381,22 +1673,26 @@ bot.catch((err, ctx) => {
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
-if (process.env.NODE_ENV === 'production' && WEBHOOK_URL) {
-  // Modo Webhook — recomendado para Railway
-  const express = require('express');
-  const app = express();
-  app.use(express.json());
-  app.use(bot.webhookCallback(`/webhook/${BOT_TOKEN}`));
-  app.get('/', (_, res) => res.send('✅ Arancel Honduras Bot activo.'));
-  bot.telegram.setWebhook(`${WEBHOOK_URL}/webhook/${BOT_TOKEN}`)
-    .then(() => console.log(`✅ Webhook configurado: ${WEBHOOK_URL}`));
-  app.listen(PORT, () => console.log(`🚀 Servidor en puerto ${PORT}`));
-} else {
-  // Modo Polling — para desarrollo local
-  bot.launch({ dropPendingUpdates: true })
-    .then(() => console.log('🤖 Bot iniciado en modo Polling (desarrollo)'))
-    .catch(err => console.error('❌ Error iniciando bot:', err));
-}
+// Inicializar DB y luego arrancar el bot
+dbInit().then(() => {
+  if (process.env.NODE_ENV === 'production' && WEBHOOK_URL) {
+    const express = require('express');
+    const app = express();
+    app.use(express.json());
+    app.use(bot.webhookCallback(`/webhook/${BOT_TOKEN}`));
+    app.get('/', (_, res) => res.send('✅ Arancel Honduras Bot activo.'));
+    bot.telegram.setWebhook(`${WEBHOOK_URL}/webhook/${BOT_TOKEN}`)
+      .then(() => console.log(`✅ Webhook configurado: ${WEBHOOK_URL}`));
+    app.listen(PORT, () => console.log(`🚀 Servidor en puerto ${PORT}`));
+  } else {
+    bot.launch({ dropPendingUpdates: true })
+      .then(() => console.log('🤖 Bot iniciado en modo Polling (desarrollo)'))
+      .catch(err => console.error('❌ Error iniciando bot:', err));
+  }
+}).catch(err => {
+  console.error('❌ Error iniciando base de datos:', err);
+  process.exit(1);
+});
 
 process.once('SIGINT', () => bot.stop('SIGINT'));
 process.once('SIGTERM', () => bot.stop('SIGTERM'));
