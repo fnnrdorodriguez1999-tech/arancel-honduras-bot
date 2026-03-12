@@ -1104,19 +1104,14 @@ async function mostrarItem(ctx, catKey, itemId) {
 // PDF
 // ============================================================
 
-const PDF_URL = 'https://investigacionjuridica.unah.edu.hn/assets/Investigacion-Juridica/paginas/boletin-informativo-2017/Arancel-del-Profesional-del-Derecho..pdf';
+const PDF_PATH = require('path').join(__dirname, 'ARANCEL-DEL-PROFESIONAL-DEL-DERECHO.pdf');
 
 async function enviarPDF(ctx) {
-  // Primero avisamos al usuario mientras preparamos el envío
-  const aviso = await ctx.reply(
-    `⏳ _Cargando el PDF del Arancel..._`,
-    { parse_mode: 'Markdown' }
-  );
+  const aviso = await ctx.reply(`⏳ _Enviando el PDF del Arancel..._`, { parse_mode: 'Markdown' });
 
   try {
-    // Intentar enviar el PDF directamente por Telegram (como documento)
     await ctx.replyWithDocument(
-      { url: PDF_URL },
+      { source: PDF_PATH, filename: 'Arancel-del-Profesional-del-Derecho-CAH-2017.pdf' },
       {
         caption:
           `📄 *Arancel del Profesional del Derecho*\n` +
@@ -1130,24 +1125,16 @@ async function enviarPDF(ctx) {
         ]),
       }
     );
-    // Borrar el mensaje de "cargando" si el envío fue exitoso
     await ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
   } catch (err) {
-    // Si falla el envío directo, mandamos el enlace de descarga manual
     console.error('[PDF] Error enviando documento:', err.message);
     await ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
     await ctx.reply(
-      `📥 *Arancel del Profesional del Derecho — Honduras*\n\n` +
-      `🗓 _Aprobado: 30 de abril de 2017_\n` +
-      `📰 _La Gaceta N° 34,403 — 29 de julio de 2017_\n\n` +
-      `🔗 *Toca el botón de abajo para descargar el PDF:*\n\n` +
-      `📌 _Si no descarga automáticamente, cópialo y pégalo en tu navegador._\n\n` +
-      `💡 _Idea y desarrollo: Abg. Brayan Fernando Padilla Rodríguez_`,
+      `⚠️ _No se pudo enviar el PDF en este momento._\n\n` +
+      `📌 _Contacta al Abg. Brayan Fernando Padilla Rodríguez para obtenerlo._`,
       {
         parse_mode: 'Markdown',
-        disable_web_page_preview: true,
         ...Markup.inlineKeyboard([
-          [Markup.button.url('📄 Descargar Arancel CAH 2017 (PDF)', PDF_URL)],
           [Markup.button.url('🌐 Sitio Oficial CAH', 'https://www.cah.hn')],
           [Markup.button.callback('🏠 Menú Principal', 'inicio')],
         ]),
