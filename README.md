@@ -195,6 +195,12 @@ Este bot es una herramienta de referencia. Los honorarios mostrados son los **m�
 
 ---
 
+## 💡 Créditos
+
+**Idea y desarrollo:** Abg. Brayan Fernando Padilla Rodríguez
+
+---
+
 ## 📞 Fuente Oficial
 
 - **Colegio de Abogados de Honduras**: [www.cah.hn](https://www.cah.hn)
