@@ -1396,7 +1396,7 @@ async function mostrarItem(ctx, catKey, itemId) {
 // PDF
 // ============================================================
 
-const PDF_PATH = require('path').join(__dirname, 'ARANCEL-DEL-PROFESIONAL-DEL-DERECHO.pdf');
+const PDF_PATH = require('path').join(__dirname, 'arancel-cah-2017.pdf');
 
 async function enviarPDF(ctx) {
   const aviso = await ctx.reply(`⏳ _Enviando el PDF del Arancel..._`, { parse_mode: 'Markdown' });
