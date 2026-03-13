@@ -1382,18 +1382,22 @@ bot.catch((err, ctx) => {
 const PORT = process.env.PORT || 3000;
 const WEBHOOK_URL = process.env.WEBHOOK_URL;
 
+// Siempre levantar servidor Express para satisfacer health checks (Koyeb/Render)
+const express = require('express');
+const app = express();
+app.use(express.json());
+app.get('/', (_, res) => res.send('✅ Arancel CAH Bot activo — Abg. Brayan Fernando Padilla Rodríguez'));
+app.listen(PORT, () => console.log(`🚀 Servidor HTTP en puerto ${PORT}`));
+
 if (process.env.NODE_ENV === 'production' && WEBHOOK_URL) {
-  const express = require('express');
-  const app = express();
-  app.use(express.json());
+  // Modo Webhook
   app.use(bot.webhookCallback(`/webhook/${BOT_TOKEN}`));
-  app.get('/', (_, res) => res.send('✅ Arancel Honduras Bot activo.'));
   bot.telegram.setWebhook(`${WEBHOOK_URL}/webhook/${BOT_TOKEN}`)
     .then(() => console.log(`✅ Webhook configurado: ${WEBHOOK_URL}`));
-  app.listen(PORT, () => console.log(`🚀 Servidor en puerto ${PORT}`));
 } else {
+  // Modo Polling — para Koyeb Free / desarrollo local
   bot.launch({ dropPendingUpdates: true })
-    .then(() => console.log('🤖 Bot iniciado en modo Polling (desarrollo)'))
+    .then(() => console.log('🤖 Bot iniciado en modo Polling'))
     .catch(err => console.error('❌ Error iniciando bot:', err));
 }
 
